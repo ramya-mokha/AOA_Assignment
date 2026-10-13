@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Smart Meeting Scheduler - Greedy Activity Selection</title>
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <header>
+      <h1>Smart Meeting Scheduler</h1>
+      <p>
+        Greedy activity selection: sort meetings by finish time, then keep every
+        meeting that still fits in a free room. Rejected meetings are the ones
+        that no room can host.
+      </p>
+    </header>
+    <main>
+      <section>
+        <h2>Meeting requests</h2>
+        <textarea
+          id="input"
+          spellcheck="false"
+          aria-label="Meeting requests"
+        ></textarea>
+        <small
+          >One meeting per line: <code>name, start, end</code> (24-hour HH:MM).
+          Lines starting with # are ignored.</small
+        >
+        <label class="f"
+          >Conference rooms
+          <input type="number" id="rooms" value="2" min="1" max="20"
+        /></label>
+        <div class="row">
+          <button class="p" id="go">Schedule meetings</button>
+          <button id="sample">Load sample day</button>
+          <label class="btn"
+            >Upload file<input type="file" id="file" accept=".csv,.txt" hidden
+          /></label>
+        </div>
+        <div id="errors" class="err" role="alert"></div>
+      </section>
+      <div class="stack">
+        <section id="out">
+          <h2>Results</h2>
+          <p class="mut">
+            Load the sample day or paste meetings, then press Schedule meetings.
+          </p>
+        </section>
+        <section>
+          <h2>Greedy vs brute force benchmark</h2>
+          <p class="mut" style="margin-top: 0">
+            Random meetings, using the room count entered on the left. Brute
+            force tries every subset and room assignment (stops after 3 million
+            nodes).
+          </p>
+          <button id="bench">Run benchmark</button>
+          <div id="benchout"></div>
+        </section>
+      </div>
+    </main>
+    <script>
+      /*ENGINE-START*/
+      // ---------- Parsing ----------
+      const toMin = (s) => {
+        const m = /^(\d{1,2}):(\d{2})$/.exec(s.trim());
+        if (!m) return NaN;
+        const h = +m[1],
+          mi = +m[2];
+        return h > 23 || mi > 59 ? NaN : h * 60 + mi;
+      };
+      const fmt = (t) =>
+        String(Math.floor(t / 60)).padStart(2, "0") +
+        ":" +
+        String(t % 60).padStart(2, "0");
+
+      function parse(text) {
+        const meetings = [],
+          errors = [];
+        text.split(/\r?\n/).forEach((raw, i) => {
+          const line = raw.trim();
+          if (!line || line.startsWith("#")) return;
+          const p = line.split(/\s*[,\t]\s*/);
+          if (p.length !== 3) {
+            errors.push(`Line ${i + 1}: expected "name, start, end"`);
+            return;
+          }
+          const s = toMin(p[1]),
+            e = toMin(p[2]);
+          if (isNaN(s) || isNaN(e)) {
+            if (meetings.length === 0 && /^name$/i.test(p[0])) return; // skip a CSV header row
+            errors.push(`Line ${i + 1}: times must look like 09:30`);
+            return;
+          }
+          if (e <= s) {
+            errors.push(`Line ${i + 1}: end must be after start`);
+            return;
+          }
+          meetings.push({
+            id: meetings.length + 1,
+            name: p[0] || "Meeting " + (meetings.length + 1),
+            start: s,
+            end: e,
+          });
+        });
+        return { meetings, errors };
+      }
+
+      // ---------- Greedy activity selection (k rooms) ----------
+      // Sort by finish time. For each meeting pick the room that became free latest
+      // but not after the meeting starts (best fit). If none exists, reject it.
+      // Time: O(n log n + n*k). With k = 1 this is the classic activity selection.
+      function greedy(meetings, k) {
+        const sorted = [...meetings].sort(
+          (a, b) => a.end - b.end || a.start - b.start,
+        );
+        const free = new Array(k).fill(-Infinity);
+        const scheduled = [],
+          rejected = [];
+        for (const m of sorted) {
+          let best = -1;
+          for (let r = 0; r < k; r++)
+            if (free[r] <= m.start && (best < 0 || free[r] > free[best]))
+              best = r;
+          if (best < 0) rejected.push(m);
+          else {
+            free[best] = m.end;
+            scheduled.push({ ...m, room: best });
+          }
+        }
+        return { scheduled, rejected };
+      }
+
+      // ---------- Brute force (exhaustive search) ----------
+      // For each meeting (sorted by start): skip it, or put it in any room that is free.
+      // Worst case O((k+1)^n). Returns the optimal count, or aborted if the node budget runs out.
+      function brute(meetings, k, budget = 3e6) {
+        const ms = [...meetings].sort(
+            (a, b) => a.start - b.start || a.end - b.end,
+          ),
+          n = ms.length;
+        const free = new Array(k).fill(-Infinity);
+        let best = 0,
+          nodes = 0;
+        const t0 = performance.now();
+        function rec(i, cnt) {
+          if (++nodes > budget) throw 0;
+          if (i === n) {
+            if (cnt > best) best = cnt;
+            return;
+          }
+          rec(i + 1, cnt);
+          let triedEmpty = false; // empty rooms are interchangeable: try only one
+          for (let r = 0; r < k; r++) {
+            if (free[r] > ms[i].start) continue;
+            if (free[r] === -Infinity) {
+              if (triedEmpty) continue;
+              triedEmpty = true;
+            }
+            const old = free[r];
+            free[r] = ms[i].end;
+            rec(i + 1, cnt + 1);
+            free[r] = old;
+          }
+        }
+        try {
+          rec(0, 0);
+        } catch (e) {
+          return { aborted: true, nodes, ms: performance.now() - t0 };
+        }
+        return { best, nodes, ms: performance.now() - t0 };
+      }
+
+      function randomMeetings(n) {
+        const a = [];
+        for (let i = 0; i < n; i++) {
+          const s = Math.floor(Math.random() * 1300),
+            d = 15 + Math.floor(Math.random() * 90);
+          a.push({
+            id: i + 1,
+            name: "M" + (i + 1),
+            start: s,
+            end: Math.min(s + d, 1439),
+          });
+        }
+        return a;
+      }
+      /*ENGINE-END*/
+
+      // ---------- UI ----------
+      const $ = (id) => document.getElementById(id);
+      const esc = (s) =>
+        s.replace(
+          /[&<>"]/g,
+          (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c],
+        );
+      const COLORS = [
+        "#0f766e",
+        "#2563eb",
+        "#7c3aed",
+        "#b45309",
+        "#be185d",
+        "#4d7c0f",
+      ];
+      const color = (r) => COLORS[r % COLORS.length];
+      const SAMPLE = `# name, start, end
+Daily Standup, 09:00, 09:30
+Design Review, 09:15, 10:30
+Client Call, 09:30, 11:00
+Sprint Planning, 10:00, 12:00
+Budget Meeting, 10:45, 11:45
+Team Lunch Talk, 12:00, 13:00
+Code Review, 11:30, 12:30
+HR Sync, 12:15, 13:15
+Architecture Talk, 13:00, 14:30
+Vendor Demo, 13:30, 15:00
+Product Roadmap, 14:00, 16:00
+Retrospective, 14:45, 15:45
+Security Briefing, 15:30, 16:30
+Interviews, 15:45, 17:15
+Wrap-up, 16:30, 17:00`;
+
+      function kRooms() {
+        return Math.max(1, Math.min(20, parseInt($("rooms").value) || 1));
+      }
+
+      function run() {
+        const { meetings, errors } = parse($("input").value);
+        $("errors").innerHTML = errors.map(esc).join("<br>");
+        if (!meetings.length) {
+          $("out").innerHTML =
+            '<h2>Results</h2><p class="mut">No valid meetings to schedule.</p>';
+          return;
+        }
+        const k = kRooms();
+        const t = performance.now();
+        const res = greedy(meetings, k);
+        const gms = performance.now() - t;
+        render(meetings, k, res, gms);
+      }
+
+      function render(meetings, k, { scheduled, rejected }, gms) {
+        const step =
+          Math.max(...meetings.map((m) => m.end)) -
+            Math.min(...meetings.map((m) => m.start)) >
+          720
+            ? 120
+            : 60;
+        const t0 =
+          Math.floor(Math.min(...meetings.map((m) => m.start)) / step) * step;
+        const span =
+          Math.ceil((Math.max(...meetings.map((m) => m.end)) - t0) / step) *
+          step;
+        const n = span / step;
+        const pos = (m) =>
+          `left:${((m.start - t0) / span) * 100}%;width:${((m.end - m.start) / span) * 100}%`;
+        const bar = (m, cls, bg) =>
+          `<div class="bar ${cls}" style="${pos(m)};${bg}" title="${esc(m.name)} ${fmt(m.start)}-${fmt(m.end)}">${esc(m.name)}</div>`;
+
+        let axis = '<div class="axis">';
+        for (let i = 0; i < n; i++)
+          axis += `<span>${fmt(t0 + i * step)}</span>`;
+        axis += "</div>";
+
+        let rows = "";
+        for (let r = 0; r < k; r++) {
+          const mine = scheduled.filter((m) => m.room === r);
+          const busy = mine.reduce((s, m) => s + m.end - m.start, 0);
+          rows += `<div class="tr"><div class="lab">Room ${r + 1}<small>${Math.round((busy / span) * 100)}% used</small></div><div class="track" style="--n:${n}">${mine.map((m) => bar(m, "", "background:" + color(r))).join("")}</div></div>`;
+        }
+        // pack rejected meetings into lanes so overlapping ones do not hide each other
+        const lanes = [];
+        [...rejected]
+          .sort((a, b) => a.start - b.start)
+          .forEach((m) => {
+            const lane = lanes.find((l) => l.end <= m.start);
+            if (lane) {
+              lane.end = m.end;
+              lane.items.push(m);
+            } else lanes.push({ end: m.end, items: [m] });
+          });
+        lanes.forEach((l, i) => {
+          rows += `<div class="tr"><div class="lab">${i === 0 ? "Rejected" : ""}</div><div class="track" style="--n:${n}">${l.items.map((m) => bar(m, "rj", "")).join("")}</div></div>`;
+        });
+
+        // optimality check against exhaustive search (small inputs only)
+        let check = "";
+        if (meetings.length <= 20) {
+          const b = brute(meetings, k);
+          check = b.aborted
+            ? '<p class="mut">Optimality check skipped: exhaustive search is too large for this input.</p>'
+            : b.best === scheduled.length
+              ? `<p class="ok">Verified optimal: greedy scheduled ${scheduled.length}, exhaustive search also found ${b.best} (${b.nodes.toLocaleString()} nodes, ${b.ms.toFixed(2)} ms).</p>`
+              : `<p class="err">Mismatch: greedy ${scheduled.length}, exhaustive ${b.best}.</p>`;
+        } else
+          check =
+            '<p class="mut">Optimality check skipped: more than 20 meetings.</p>';
+
+        const sch = [...scheduled]
+          .sort((a, b) => a.room - b.room || a.start - b.start)
+          .map(
+            (m) =>
+              `<tr><td><span class="sw" style="background:${color(m.room)}"></span>Room ${m.room + 1}</td><td>${esc(m.name)}</td><td class="t">${fmt(m.start)}-${fmt(m.end)}</td></tr>`,
+          )
+          .join("");
+        const rej = [...rejected]
+          .sort((a, b) => a.start - b.start)
+          .map(
+            (m) =>
+              `<tr><td>${esc(m.name)}</td><td class="t">${fmt(m.start)}-${fmt(m.end)}</td></tr>`,
+          )
+          .join("");
+
+        $("out").innerHTML = `<h2>Results</h2>
+  <div class="stats">
+    <div class="stat"><b>${meetings.length}</b>requested</div>
+    <div class="stat"><b>${scheduled.length}</b>scheduled</div>
+    <div class="stat"><b>${rejected.length}</b>rejected</div>
+    <div class="stat"><b>${gms.toFixed(2)} ms</b>greedy time</div>
+  </div>
+  <div class="tl"><div class="tl-in">${axis}${rows}</div></div>
+  ${check}
+  <div class="cols">
+    <div><h2>Scheduled</h2><table><tr><th>Room</th><th>Meeting</th><th class="t">Time</th></tr>${sch}</table></div>
+    <div><h2>Rejected</h2>${rej ? `<table><tr><th>Meeting</th><th class="t">Time</th></tr>${rej}</table>` : '<p class="mut">Every meeting fit.</p>'}</div>
+  </div>`;
+      }
+
+      function bench() {
+        const k = kRooms();
+        let html = `<h3>Greedy vs brute force (${k} room${k > 1 ? "s" : ""})</h3><table><tr><th>n</th><th>Greedy (ms)</th><th>Brute force (ms)</th><th>Brute nodes</th><th>Same count?</th></tr>`;
+        for (const n of [8, 12, 16, 20, 24]) {
+          const ms = randomMeetings(n);
+          const t = performance.now();
+          const g = greedy(ms, k);
+          const gt = performance.now() - t;
+          const b = brute(ms, k);
+          html += `<tr><td>${n}</td><td>${gt.toFixed(3)}</td><td>${b.aborted ? "&gt; budget" : b.ms.toFixed(3)}</td><td>${b.nodes.toLocaleString()}</td><td>${b.aborted ? "-" : b.best === g.scheduled.length ? "yes" : "NO"}</td></tr>`;
+        }
+        html +=
+          "</table><h3>Greedy only, large inputs</h3><table><tr><th>n</th><th>Greedy (ms)</th><th>Scheduled</th></tr>";
+        for (const n of [1e3, 1e4, 1e5, 1e6]) {
+          const ms = randomMeetings(n);
+          const t = performance.now();
+          const g = greedy(ms, k);
+          const gt = performance.now() - t;
+          html += `<tr><td>${n.toLocaleString()}</td><td>${gt.toFixed(1)}</td><td>${g.scheduled.length.toLocaleString()}</td></tr>`;
+        }
+        $("benchout").innerHTML = html + "</table>";
+      }
+
+      $("go").onclick = run;
+      $("bench").onclick = () => {
+        $("benchout").innerHTML = '<p class="mut">Running...</p>';
+        setTimeout(bench, 30);
+      };
+      $("sample").onclick = () => {
+        $("input").value = SAMPLE;
+        $("rooms").value = 2;
+        run();
+      };
+      $("file").onchange = (e) => {
+        const f = e.target.files[0];
+        if (!f) return;
+        const r = new FileReader();
+        r.onload = () => {
+          $("input").value = r.result;
+          run();
+        };
+        r.readAsText(f);
+        e.target.value = "";
+      };
+      $("input").value = SAMPLE;
+      run();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,11 @@
+# Edge cases: back-to-back meetings (end == start is allowed),
+# identical slots, a comment, and two invalid lines to show error handling.
+Meeting A, 09:00, 10:00
+Meeting B, 10:00, 11:00
+Meeting C, 10:00, 11:00
+Meeting D, 09:30, 10:30
+Meeting E, 11:00, 12:00
+Meeting F, 11:00, 11:30
+Bad Line, 25:00, 26:00
+Reversed, 15:00, 14:00
+Late Meeting, 16:00, 17:00
